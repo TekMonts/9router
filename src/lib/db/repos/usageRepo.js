@@ -2,6 +2,7 @@ import { EventEmitter } from "events";
 import { getAdapter } from "../driver.js";
 import { parseJson, stringifyJson } from "../helpers/jsonCol.js";
 import { getMeta, setMeta } from "../helpers/metaStore.js";
+import { STREAM_MAX_DURATION_MS } from "open-sse/config/runtimeConfig.js";
 
 function maskApiKey(key) {
   if (!key || typeof key !== "string") return null;
@@ -9,7 +10,11 @@ function maskApiKey(key) {
   return key.slice(0, 8) + "***";
 }
 
-const PENDING_TIMEOUT_MS = 60 * 1000;
+// Safety net that force-zeroes the pending counters if the "done" signal never
+// arrives. Must outlive the longest possible stream: a stream running up to
+// STREAM_MAX_DURATION_MS would otherwise be shown as finished while still
+// streaming. Keep a 60s grace beyond the max stream duration.
+const PENDING_TIMEOUT_MS = STREAM_MAX_DURATION_MS + 60 * 1000;
 const RING_CAP = 50;
 const CONN_CACHE_TTL_MS = 30 * 1000;
 const PERIOD_MS = { "24h": 86400000, "7d": 604800000, "30d": 2592000000, "60d": 5184000000 };
