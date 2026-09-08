@@ -13,6 +13,9 @@ COPY package.json ./
 RUN npm install --registry=https://registry.npmmirror.com
 
 COPY . ./
+# amd64 leg builds under qemu on ARM hosts; default qemu64 CPU model segfaults V8/SWC.
+# Must be a Dockerfile ENV: qemu reads it at startup, before the RUN shell exists.
+ENV QEMU_CPU=max
 ENV NEXT_TELEMETRY_DISABLED=1
 RUN npm run build
 
