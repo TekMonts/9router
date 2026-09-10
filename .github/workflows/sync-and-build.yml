@@ -33,12 +33,15 @@ jobs:
           if [ "$BEHIND" -eq 0 ]; then
             echo "No upstream changes"; exit 0
           fi
-          git merge --ff-only upstream/master || { echo "ff-only failed — needs manual merge"; exit 1; }
+          # Plain merge, not ff-only: the fork carries fork-only commits
+          # (stream watchdogs a7c38105, Playground swap 592a2e8b) so the
+          # histories have diverged permanently.
+          git merge upstream/master -m "Merge upstream decolua/9router" || { echo "merge conflict — needs manual resolution"; exit 1; }
           git push origin master
 
-      - name: Strip NineRemote remnants
+      - name: Apply fork patches
         if: steps.sync.outputs.behind != '0'
-        run: node scripts/strip-nine-remote.mjs
+        run: node scripts/apply-fork-patches.mjs
 
       - name: Verify playground route exists
         if: steps.sync.outputs.behind != '0'
@@ -52,7 +55,7 @@ jobs:
         run: |
           if ! git diff --quiet; then
             git add -A
-            git commit -m "fix(dashboard): strip NineRemote remnants post-sync"
+            git commit -m "fix: apply fork patches post-sync (NineRemote strip, stream watchdogs)"
             git push origin master
           fi
 
