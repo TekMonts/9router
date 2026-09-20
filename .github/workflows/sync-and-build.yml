@@ -33,10 +33,15 @@ jobs:
           if [ "$BEHIND" -eq 0 ]; then
             echo "No upstream changes"; exit 0
           fi
-          # Plain merge, not ff-only: the fork carries fork-only commits
-          # (stream watchdogs a7c38105, Playground swap 592a2e8b) so the
-          # histories have diverged permanently.
-          git merge upstream/master -m "Merge upstream decolua/9router" || { echo "merge conflict — needs manual resolution"; exit 1; }
+          # Merge upstream with the recursive strategy and -X theirs; the
+          # fork's own copy of these files wins, then the patch layer is
+          # re-applied on top. This keeps the next sync conflict-free: fork
+          # transformations are a layer, never committed diverging edits that
+          # upstream's next change would collide with.
+          git -c merge.conflictstyle=diff3 merge upstream/master \
+            -X theirs --no-edit \
+            -m "Merge upstream decolua/9router" \
+            || { echo "merge conflict — needs manual resolution"; exit 1; }
           git push origin master
 
       - name: Apply fork patches
