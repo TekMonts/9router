@@ -2,67 +2,154 @@ name: Sync upstream and publish ai-router
 
 on:
   schedule:
-    - cron: "17 3 * * *" # daily 03:17 UTC; skips if upstream unchanged
+    - cron: "0 17 * * *" # 00:00 GMT+7 (17:00 UTC of the previous day)
   workflow_dispatch:
+    inputs:
+      force_build:
+        description: "Build even if an image for current HEAD already exists"
+        type: boolean
+        default: false
+
+# One run at a time; never cancel a run that is mid-publish.
+concurrency:
+  group: ai-router-sync-publish
+  cancel-in-progress: false
+
+permissions:
+  contents: read
 
 env:
   IMAGE: ghcr.io/tekmonts/ai-router
   UPSTREAM: decolua/9router
+  RETIRED_WORKFLOW: .github/workflows/docker-publish.yml
 
 jobs:
-  sync-and-build:
+  # ---------------------------------------------------------------------------
+  # 1. Sync fork + apply patch layer + decide whether a build is needed.
+  #    Convergent: build need is derived from "does image sha-<HEAD> exist",
+  #    not from "was upstream ahead", so a failed earlier run self-heals.
+  # ---------------------------------------------------------------------------
+  sync:
+    name: Sync fork and patch
+    if: github.ref == 'refs/heads/master'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: write
-      packages: write
+      packages: read
+    outputs:
+      build: ${{ steps.plan.outputs.build }}
+      commit: ${{ steps.plan.outputs.commit }}
+      short: ${{ steps.plan.outputs.short }}
+      version: ${{ steps.plan.outputs.version }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          # PAT needed when upstream touches .github/workflows (GITHUB_TOKEN can't push those)
           token: ${{ secrets.SYNC_PAT || github.token }}
 
-      - name: Sync fork with upstream
-        id: sync
+      - name: Merge upstream
         run: |
+          set -euo pipefail
           git config user.name "TekMonts"
           git config user.email "baoquoc.803@gmail.com"
           git remote add upstream "https://github.com/${UPSTREAM}.git"
-          git fetch upstream master
-          BEHIND=$(git rev-list --count HEAD..upstream/master)
-          echo "behind=$BEHIND" >> "$GITHUB_OUTPUT"
-          if [ "$BEHIND" -eq 0 ]; then
-            echo "No upstream changes"; exit 0
+          git fetch --no-tags upstream master
+          behind=$(git rev-list --count HEAD..upstream/master)
+          echo "upstream ahead by: $behind"
+          if [ "$behind" -eq 0 ]; then exit 0; fi
+          # -X theirs: upstream wins on content conflicts; the patch layer is
+          # re-applied on top in the next step, so forks never carry diverging edits.
+          if ! git merge upstream/master -X theirs --no-edit -m "Merge upstream ${UPSTREAM}"; then
+            # -X theirs does not resolve modify/delete. The retired upstream publish
+            # workflow is the only conflict we accept (keep it deleted).
+            other=$(git diff --name-only --diff-filter=U | grep -vxF "$RETIRED_WORKFLOW" || true)
+            if [ -n "$other" ]; then
+              echo "::error::unresolved merge conflicts, manual resolution needed:"
+              echo "$other"
+              exit 1
+            fi
+            git rm -q -- "$RETIRED_WORKFLOW"
+            git commit --no-edit
           fi
-          # Merge upstream with the recursive strategy and -X theirs; the
-          # fork's own copy of these files wins, then the patch layer is
-          # re-applied on top. This keeps the next sync conflict-free: fork
-          # transformations are a layer, never committed diverging edits that
-          # upstream's next change would collide with.
-          git -c merge.conflictstyle=diff3 merge upstream/master \
-            -X theirs --no-edit \
-            -m "Merge upstream decolua/9router" \
-            || { echo "merge conflict — needs manual resolution"; exit 1; }
-          git push origin master
 
       - name: Apply fork patches
-        if: steps.sync.outputs.behind != '0'
-        run: node scripts/apply-fork-patches.mjs
+        run: node scripts/apply-fork-patches.mjs # must stay idempotent
 
       - name: Verify playground route exists
-        if: steps.sync.outputs.behind != '0'
         run: |
           test -f "src/app/(dashboard)/dashboard/playground/page.js" \
-            || { echo "playground page missing"; exit 1; }
+            || { echo "::error::playground page missing"; exit 1; }
 
-      - name: Commit patch
-        id: patch
-        if: steps.sync.outputs.behind != '0'
+      - name: Commit and push (single push)
         run: |
-          if ! git diff --quiet; then
+          set -euo pipefail
+          if [ -n "$(git status --porcelain)" ]; then
             git add -A
             git commit -m "fix: apply fork patches post-sync (NineRemote strip, stream watchdogs)"
-            git push origin master
           fi
+          if [ -n "$(git rev-list origin/master..HEAD)" ]; then
+            git push origin HEAD:master
+          fi
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Plan build
+        id: plan
+        env:
+          FORCE: ${{ inputs.force_build }}
+        run: |
+          set -euo pipefail
+          commit=$(git rev-parse HEAD)
+          short=${commit::7}
+          version=$(node -p "require('./package.json').version")
+          [[ "$version" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]] \
+            || { echo "::error::not a valid Docker tag: $version"; exit 1; }
+          build=true
+          # sha-<short> is the "built and verified" marker, created last in publish.
+          if [ "$FORCE" != "true" ] && docker buildx imagetools inspect "${IMAGE}:sha-${short}" >/dev/null 2>&1; then
+            build=false
+          fi
+          {
+            echo "build=$build"
+            echo "commit=$commit"
+            echo "short=$short"
+            echo "version=$version"
+          } >> "$GITHUB_OUTPUT"
+          echo "HEAD=$short version=$version build=$build"
+
+  # ---------------------------------------------------------------------------
+  # 2. Native per-arch build (no QEMU), push by digest, smoke-test the digest.
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build ${{ matrix.suffix }}
+    needs: sync
+    if: needs.sync.outputs.build == 'true'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false # keep the other arch running so its cache is still exported
+      matrix:
+        include:
+          - platform: linux/amd64
+            suffix: amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            suffix: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync.outputs.commit }}
+          fetch-depth: 1
 
       - uses: docker/setup-buildx-action@v3
 
@@ -72,15 +159,151 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push multi-arch
-        if: steps.sync.outputs.behind != '0'
+      - name: Build and push platform image by digest
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
-          push: true
-          platforms: linux/amd64,linux/arm64
-          tags: ${{ env.IMAGE }}:latest
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          build-args: |
+            APP_VERSION=${{ needs.sync.outputs.version }}
+            ALPINE_MIRROR=${{ vars.ALPINE_MIRROR || 'dl-cdn.alpinelinux.org' }}
+            NPM_REGISTRY=${{ vars.NPM_REGISTRY || 'https://registry.npmjs.org/' }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ needs.sync.outputs.commit }}
+            org.opencontainers.image.version=${{ needs.sync.outputs.version }}
+          cache-from: type=gha,scope=ai-router-${{ matrix.suffix }}
+          cache-to: type=gha,mode=max,scope=ai-router-${{ matrix.suffix }}
           provenance: false
           sbom: false
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+
+      - name: Smoke-test platform image
+        env:
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -Eeuo pipefail
+          [[ "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          c="smoke-${GITHUB_RUN_ID}-${{ matrix.suffix }}"
+          trap 'docker rm -f "$c" >/dev/null 2>&1 || true' EXIT
+          docker run --detach --name "$c" --platform "$PLATFORM" \
+            --publish 20128:20128 "${IMAGE}@${IMAGE_DIGEST}"
+          for i in $(seq 1 45); do
+            if curl --fail --silent --show-error http://127.0.0.1:20128/api/health; then
+              echo "${PLATFORM} health OK"; exit 0
+            fi
+            sleep 2
+          done
+          echo "${PLATFORM} health check failed; logs:" >&2
+          docker logs "$c" || true
+          exit 1
+
+      - name: Save digest
+        env:
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/digests"
+          printf '%s\n' "$IMAGE_DIGEST" > "$RUNNER_TEMP/digests/${{ matrix.suffix }}.txt"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.suffix }}
+          path: ${{ runner.temp }}/digests/${{ matrix.suffix }}.txt
+          if-no-files-found: error
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------
+  # 3. Merge digests into a manifest list, verify, smoke-test, then promote.
+  #    Order matters: :<version> (staging) -> verify -> smoke -> :latest + :sha-<short>.
+  #    sha-<short> is created last so a failed run is rebuilt on the next schedule.
+  # ---------------------------------------------------------------------------
+  publish:
+    name: Publish manifest
+    needs: [sync, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    env:
+      VERSION: ${{ needs.sync.outputs.version }}
+      SHORT: ${{ needs.sync.outputs.short }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: digests-*
+          path: ${{ runner.temp }}/digests
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create and verify version manifest
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          cat > "$RUNNER_TEMP/verify.sh" <<'EOF'
+          verify_platforms() {
+            local actual
+            actual=$(docker buildx imagetools inspect --raw "$1" | jq -r '[.manifests[]
+              | select(.platform.os != null and .platform.architecture != null and .platform.os != "unknown")
+              | "\(.platform.os)/\(.platform.architecture)"] | sort | join(",")')
+            if [[ "$actual" != "linux/amd64,linux/arm64" ]]; then
+              echo "::error::platform mismatch for $1: ${actual:-<none>}" >&2
+              return 1
+            fi
+          }
+          EOF
+          files=("$RUNNER_TEMP"/digests/*.txt)
+          [[ "${#files[@]}" -eq 2 ]] || { echo "::error::expected 2 digests, got ${#files[@]}"; exit 1; }
+          sources=()
+          for f in "${files[@]}"; do
+            d="$(tr -d '\n' < "$f")"
+            [[ "$d" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::invalid digest in $f"; exit 1; }
+            sources+=("${IMAGE}@${d}")
+          done
+          docker buildx imagetools create --tag "${IMAGE}:${VERSION}" "${sources[@]}"
+          source "$RUNNER_TEMP/verify.sh"
+          verify_platforms "${IMAGE}:${VERSION}"
+          docker buildx imagetools inspect "${IMAGE}:${VERSION}"
+
+      - name: Smoke-test resolved version manifest
+        run: |
+          set -Eeuo pipefail
+          c="smoke-manifest-${GITHUB_RUN_ID}"
+          trap 'docker rm -f "$c" >/dev/null 2>&1 || true' EXIT
+          docker run --detach --name "$c" --publish 20128:20128 "${IMAGE}:${VERSION}"
+          for i in $(seq 1 30); do
+            if curl --fail --silent --show-error http://127.0.0.1:20128/api/health; then
+              echo "manifest health OK"; exit 0
+            fi
+            sleep 2
+          done
+          echo "manifest health check failed; logs:" >&2
+          docker logs "$c" || true
+          exit 1
+
+      - name: Promote latest + sha marker
+        run: |
+          set -euo pipefail
+          source "$RUNNER_TEMP/verify.sh"
+          docker buildx imagetools create \
+            --tag "${IMAGE}:latest" \
+            --tag "${IMAGE}:sha-${SHORT}" \
+            "${IMAGE}:${VERSION}"
+          verify_platforms "${IMAGE}:latest"
+          verify_platforms "${IMAGE}:sha-${SHORT}"
+          {
+            echo "### Published"
+            echo "- \`${IMAGE}:latest\`"
+            echo "- \`${IMAGE}:${VERSION}\` (mutable per version)"
+            echo "- \`${IMAGE}:sha-${SHORT}\` (immutable, rollback target)"
+          } >> "$GITHUB_STEP_SUMMARY"
