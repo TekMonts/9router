@@ -58,6 +58,13 @@ export const STREAM_STALL_TIMEOUT_MS = envMs("STREAM_STALL_TIMEOUT_MS", 360 * 10
 // never re-armed — distinct from the per-chunk stall timer above.
 export const STREAM_FIRST_CHUNK_TIMEOUT_MS = envMs("STREAM_FIRST_CHUNK_TIMEOUT_MS", 200 * 1000);
 
+// Absolute ceiling on total stream lifetime - the slow-drip guard.
+// Env: STREAM_MAX_DURATION_MS. ONE-SHOT from stream start, NEVER re-armed.
+// Catches the case the inter-chunk stall timer cannot: an upstream that trickles
+// one byte every few minutes so the per-chunk timer keeps resetting but the
+// stream would otherwise run forever. Default is intentionally generous.
+export const STREAM_MAX_DURATION_MS = envMs("STREAM_MAX_DURATION_MS", 30 * 60 * 1000);
+
 // Combo empty-content failover: how long a 2xx stream may be held while waiting for its first
 // content-bearing frame before committing to that model (fail-open on expiry).
 // Env: EMPTY_PEEK_DEADLINE_MS.
