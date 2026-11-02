@@ -53,8 +53,9 @@ if (existsSync(SIDEBAR)) {
   // 2b. Strip showRemoteModal state line.
   src = src.replace(/^\s*const \[showRemoteModal, setShowRemoteModal\] = useState\(false\);\s*\n/m, '');
 
-  // 2c. Strip the "Remote" button block (opening comment through </button>).
-  src = src.replace(/[ \t]*\{\/\* Remote \*\/\}\n(?:.*\n)*?[ \t]*<\/button>\n/g, '');
+  // 2c. Strip the "Remote" block (opening comment through </button> — or </a>,
+  //      which upstream switched to when the item became an external link).
+  src = src.replace(/[ \t]*\{\/\* Remote \*\/\}\n(?:.*\n)*?[ \t]*<\/(?:button|a)>\n/g, '');
 
   // 2d. Strip the "Remote Promo Modal" comment line and the component render
   //      (markup varies; only the comment is guaranteed, so also match the
@@ -79,9 +80,11 @@ if (existsSync(SIDEBAR)) {
     console.log(`patched ${SIDEBAR}`);
   }
 
-  // 2g. Post-conditions: nothing NineRemote / showRemoteModal / 9English left.
-  if (/NineRemote|showRemoteModal|9English/.test(src)) {
-    problems.push(`unhandled NineRemote/9English reference in ${SIDEBAR}`);
+  // 2g. Post-conditions: nothing NineRemote / showRemoteModal / 9Remote / 9English left.
+  //      `9Remote` is checked separately: upstream turned the item into an <a>,
+  //      so a `</button>`-only match silently passed this guard with the link intact.
+  if (/NineRemote|showRemoteModal|9Remote|9English/.test(src)) {
+    problems.push(`unhandled NineRemote/9Remote/9English reference in ${SIDEBAR}`);
   }
   if (!src.includes('"/dashboard/playground"')) {
     problems.push(`${SIDEBAR}: Playground entry missing`);
